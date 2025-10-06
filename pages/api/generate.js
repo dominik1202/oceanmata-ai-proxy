@@ -1,5 +1,5 @@
 export default async function handler(req, res) {
-  // --- CORS (von welchen Webseiten Anfragen erlaubt sind) ---
+  // --- CORS ---
   const origins = (process.env.ALLOWED_ORIGINS || "")
     .split(",").map(s => s.trim()).filter(Boolean);
   const origin = req.headers.origin || "";
@@ -17,24 +17,19 @@ export default async function handler(req, res) {
   try {
     const {
       prompt = "",
-      negative_prompt = "low quality, blurry, artifacts, watermark, text",
       imageDataURL,
+      // optionale Felder – viele Modelle ignorieren width/height und nutzen die Bildgröße
       width = 1024,
       height = 1024,
-      strength = 0.65,
-      guidance = 7.0,
-      seed = null,
-      scheduler = "K_EULER",
-      mode = "preview",
+      mode = "preview"
     } = req.body || {};
 
     if (!imageDataURL) return res.status(400).json({ error: "imageDataURL is required" });
 
-    // DataURL -> Base64
     const base64 = String(imageDataURL).split(",")[1];
     if (!base64) return res.status(400).json({ error: "invalid imageDataURL" });
 
-    // 1) Bild zu Replicate hochladen (gibt uns eine URL)
+    // 1) Upload zu Replicate, damit wir eine URL haben
     const uploadResp = await fetch("https://api.replicate.com/v1/files", {
       method: "POST",
       headers: {
@@ -51,11 +46,7 @@ export default async function handler(req, res) {
     const image_url = uploaded?.urls?.get || uploaded?.url;
     if (!image_url) return res.status(500).json({ error: "no uploaded image url" });
 
-    // 2) SDXL Image-to-Image starten
-    const w = mode === "final" ? Math.min(2000, width) : Math.min(1024, width);
-    const h = mode === "final" ? Math.min(2000, height) : Math.min(1024, height);
-    const str = Math.max(0, Math.min(1, strength));
-
+    // 2) flux-kontext-pro auf Replicate starten (kontextbasiertes Editieren)
     const start = await fetch("https://api.replicate.com/v1/predictions", {
       method: "POST",
       headers: {
@@ -63,18 +54,18 @@ export default async function handler(req, res) {
         "Content-Type": "application/json",
       },
       body: JSON.stringify({
-        model: "stability-ai/sdxl",
+        model: "black-forest-labs/flux-kontext-pro",
         input: {
-          prompt,
-          negative_prompt,
+          // Minimal nötig:
+          prompt,         // z.B. "increase turquoise 20%, smoother texture"
           image: image_url,
-          strength: str,           // 0..1 wie stark vom Prompt überlagern
-          width: w,
-          height: h,
-          guidance_scale: guidance,
-          scheduler,
-          seed
-        },
+          // Häufig akzeptierte optionale Parameter:
+          width, height,              // kann ignoriert werden, je nach Modell
+          num_inference_steps: mode === "final" ? 30 : 18,
+          guidance: 3.5,              // niedriger als SDXL üblich; Model folgt Prompts gut
+          seed: null                  // null = random
+          // Wenn das Modell Spalten anders nennt, ignoriert es unbekannte Felder einfach.
+        }
       }),
     });
     if (!start.ok) {
@@ -83,7 +74,7 @@ export default async function handler(req, res) {
     }
     let pred = await start.json();
 
-    // 3) Warten bis fertig
+    // 3) Polling bis fertig
     const begin = Date.now();
     while (pred.status === "starting" || pred.status === "processing") {
       await new Promise((z) => setTimeout(z, 1500));
