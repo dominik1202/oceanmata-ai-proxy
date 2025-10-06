@@ -1,0 +1,12 @@
+{
+  "name": "oceanmata-ai-proxy",
+  "version": "1.0.0",
+  "description": "Serverless Proxy für Shopify x Replicate (Flux Kontext Pro)",
+  "type": "module",
+  "scripts": {
+    "dev": "vercel dev",
+    "start": "vercel dev"
+  },
+  "author": "Dominik Karl",
+  "license": "MIT"
+}
