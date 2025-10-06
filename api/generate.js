@@ -1,124 +1,142 @@
-import fetch from "node-fetch";
+// /api/generate.js  — Vercel Serverless Function (Node)
+// CORS: immer zuerst setzen!  Accepts HTTP image URLs and Data-URLs.
 
 export default async function handler(req, res) {
-  // ✅ Universelles CORS-Setup (alle Methoden, alle Domains)
+  // ---- CORS (für alle Antworten, auch Fehler) ----
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Requested-With");
 
   if (req.method === "OPTIONS") {
+    // Preflight erfolgreich beenden
     return res.status(200).end();
   }
 
-  if (req.method !== "POST") {
-    return res.status(405).json({ error: "Method not allowed" });
-  }
-
-  res.setHeader("Access-Control-Allow-Origin", "*");
-
   try {
-    const { prompt, imageDataURL, mode } = req.body || {};
-    const REPLICATE_TOKEN = process.env.REPLICATE_API_TOKEN;
+    if (req.method !== "POST") {
+      return res.status(405).json({ error: "Method not allowed" });
+    }
 
+    const REPLICATE_TOKEN = process.env.REPLICATE_API_TOKEN;
     if (!REPLICATE_TOKEN) {
       return res.status(500).json({ error: "Missing REPLICATE_API_TOKEN" });
     }
 
+    // Body sicher einlesen (bei Vercel kann req.body undefiniert sein)
+    const rawBody = await readBody(req);
+    let body = {};
+    try { body = rawBody ? JSON.parse(rawBody) : {}; }
+    catch (e) { return res.status(400).json({ error: "Invalid JSON", detail: String(e?.message || e) }); }
+
+    const {
+      prompt = "",
+      imageDataURL,
+      mode = "preview",
+      width = mode === "final" ? 2000 : 1024,
+      height = mode === "final" ? 2000 : 1024,
+      num_inference_steps = mode === "final" ? 30 : 18
+    } = body;
+
     if (!imageDataURL) {
-      return res.status(400).json({ error: "imageDataURL missing" });
+      return res.status(400).json({ error: "imageDataURL is required" });
     }
 
-    // --- 1️⃣ Base64-Teil aus DataURL extrahieren ---
-    let base64 = imageDataURL.split(",")[1];
-    if (!base64) {
-      return res.status(400).json({ error: "invalid data URL (no base64 part)" });
-    }
+    // ---- Bild vorbereiten -> image_url ----
+    let image_url;
 
-    // Entferne Whitespaces oder Zeilenumbrüche (manche Browser fügen welche hinzu)
-    base64 = base64.replace(/\s/g, "");
+    if (typeof imageDataURL === "string" && imageDataURL.startsWith("http")) {
+      // direkte HTTP-URL (Shopify/CDN)
+      image_url = imageDataURL;
+    } else if (typeof imageDataURL === "string" && imageDataURL.startsWith("data:image/")) {
+      // Data-URL -> Bytes -> Upload zu Replicate
+      let base64 = imageDataURL.split(",")[1];
+      if (!base64) return res.status(400).json({ error: "invalid data URL (no base64 part)" });
+      base64 = base64.replace(/\s/g, ""); // evtl. Whitespaces entfernen
+      const bytes = Buffer.from(base64, "base64");
+      if (!bytes.length) return res.status(400).json({ error: "invalid data URL (empty after decode)" });
 
-    const bytes = Buffer.from(base64, "base64");
-    if (!bytes.length) {
-      return res.status(400).json({ error: "invalid data URL (empty after decode)" });
-    }
-
-    // --- 2️⃣ Datei zu Replicate hochladen ---
-    const up = await fetch("https://api.replicate.com/v1/files", {
-      method: "POST",
-      headers: {
-        Authorization: `Token ${REPLICATE_TOKEN}`,
-        "Content-Type": "application/octet-stream",
-        "Content-Length": String(bytes.length),
-      },
-      body: bytes,
-    });
-
-    if (!up.ok) {
-      const detail = await up.text().catch(() => "");
-      return res.status(500).json({ error: "upload failed", detail });
-    }
-
-    const uploaded = await up.json();
-    const imageUrl = uploaded.urls?.get;
-    if (!imageUrl) {
-      return res.status(500).json({ error: "upload response invalid", uploaded });
-    }
-
-    // --- 3️⃣ Model-Version für flux-kontext-pro festlegen ---
-    const MODEL_VERSION =
-      "black-forest-labs/flux-kontext-pro:525e9f5e0a26c9b12dbcc69ad74246ad798e9dfb43a7379f06f3ddc5e679ff52";
-
-    // --- 4️⃣ Prompt an Modell schicken ---
-    const run = await fetch("https://api.replicate.com/v1/predictions", {
-      method: "POST",
-      headers: {
-        Authorization: `Token ${REPLICATE_TOKEN}`,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({
-        version: MODEL_VERSION,
-        input: {
-          prompt,
-          image: imageUrl,
-          mode: mode || "preview",
+      const up = await fetch("https://api.replicate.com/v1/files", {
+        method: "POST",
+        headers: {
+          Authorization: `Token ${REPLICATE_TOKEN}`,
+          "Content-Type": "application/octet-stream",
+          "Content-Length": String(bytes.length)
         },
-      }),
-    });
-
-    if (!run.ok) {
-      const detail = await run.text().catch(() => "");
-      return res.status(500).json({ error: "replicate start failed", detail });
-    }
-
-    const runData = await run.json();
-
-    // --- 5️⃣ Ergebnis abholen ---
-    let status = runData.status;
-    let output;
-    let tries = 0;
-
-    while (status !== "succeeded" && status !== "failed" && tries < 50) {
-      await new Promise((r) => setTimeout(r, 2000));
-      const poll = await fetch(`https://api.replicate.com/v1/predictions/${runData.id}`, {
-        headers: { Authorization: `Token ${REPLICATE_TOKEN}` },
+        body: bytes
       });
-      const pollData = await poll.json();
-      status = pollData.status;
-      output = pollData.output;
-      tries++;
+      if (!up.ok) {
+        return res.status(500).json({ error: "upload failed", detail: await up.text().catch(()=> "") });
+      }
+      const file = await up.json();
+      image_url = file?.urls?.get || file?.url;
+      if (!image_url) return res.status(500).json({ error: "no uploaded image url" });
+    } else {
+      return res.status(400).json({ error: "invalid imageDataURL" });
     }
 
-    if (status !== "succeeded") {
-      return res.status(500).json({ error: "generation failed", status });
+    // ---- Prediction starten: Modell-Endpoint (keine version nötig) ----
+    const start = await fetch(
+      "https://api.replicate.com/v1/models/black-forest-labs/flux-kontext-pro/predictions",
+      {
+        method: "POST",
+        headers: {
+          Authorization: `Token ${REPLICATE_TOKEN}`,
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify({
+          input: {
+            prompt,
+            image: image_url,
+            width,
+            height,
+            num_inference_steps
+          }
+        })
+      }
+    );
+
+    if (!start.ok) {
+      return res.status(500).json({ error: "replicate start failed", detail: await start.text().catch(()=> "") });
     }
 
-    // --- 6️⃣ Rückgabe an Frontend ---
-    return res.status(200).json({ imageUrl: output[0] });
-  } catch (err) {
-    console.error("Server error:", err);
-    return res.status(500).json({
-      error: "Server crashed",
-      detail: err?.message || String(err),
-    });
+    let pred = await start.json();
+
+    // ---- Polling bis fertig (max ~2 min) ----
+    const t0 = Date.now();
+    while (pred.status === "starting" || pred.status === "processing") {
+      await sleep(1500);
+      const chk = await fetch(`https://api.replicate.com/v1/predictions/${pred.id}`, {
+        headers: { Authorization: `Token ${REPLICATE_TOKEN}` }
+      });
+      pred = await chk.json();
+      if (Date.now() - t0 > 120000) return res.status(504).json({ error: "timeout" });
+    }
+
+    if (pred.status !== "succeeded") {
+      return res.status(500).json({ error: "generation failed", detail: pred?.error || pred?.logs || pred });
+    }
+
+    const out = Array.isArray(pred.output) ? pred.output : [pred.output];
+    const imageUrl = out[0];
+    if (!imageUrl) return res.status(500).json({ error: "no output image" });
+
+    return res.status(200).json({ imageUrl });
+  } catch (e) {
+    // Immer JSON zurückgeben (sonst zeigt der Browser „Failed to fetch“)
+    return res.status(500).json({ error: "unhandled", detail: String(e?.message || e) });
   }
+}
+
+// ---- Helpers ----
+function sleep(ms){ return new Promise(r => setTimeout(r, ms)); }
+function readBody(req){
+  return new Promise((resolve, reject) => {
+    let data = "";
+    try {
+      req.setEncoding("utf8");
+      req.on("data", chunk => { data += chunk; });
+      req.on("end", () => resolve(data));
+      req.on("error", reject);
+    } catch (e) { reject(e); }
+  });
 }
